@@ -1,3 +1,35 @@
+import { McpServer } from "@modelcontextprotocol/server";
+import { createMcpHandler } from "agents/mcp/server";
+import { z } from "zod";
+import policy from "./policy_rules.json";
+
+// Demo-only identity: one secret maps to one synthetic employee.
+type AppEnv = { DB: D1Database; MCP_API_KEY: string; RESEND_API_KEY: string; FINANCE_EMAIL: string; SENDER_EMAIL: string; DEMO_EMPLOYEE_ID: string };
+const text = z.string().trim().min(1).max(500);
+const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(s => { const d = new Date(s + "T00:00:00Z"); return Number.isFinite(d.getTime()) && d.toISOString().slice(0,10) === s; }, "Invalid calendar date");
+const category = z.enum(["transportation", "client_meal", "office_supplies"]);
+const receipt = z.object({ merchant: text, receipt_number: text.nullish(), transaction_date: date, amount_sar: z.number().positive().max(100000).refine(n => Math.abs(n*100-Math.round(n*100)) < 0.000001, "Use at most two decimal places"), currency: z.literal("SAR") }).strict();
+const claim = receipt.extend({ expense_category: category, business_purpose: text, client_name: text.nullish(), project_name: text.nullish(), destination: text.nullish(), attendees: z.array(text).max(30).optional(), employee_confirmed: z.literal(true) }).strict();
+const reason = z.enum(["POTENTIAL_DUPLICATE", "TRANSACTION_LIMIT_EXCEEDED", "MONTHLY_LIMIT_EXCEEDED"]);
+const escalation = claim.extend({ reason_code: reason }).strict();
+const filters = z.object({ claim_id: text.optional(), expense_category: category.optional(), status: z.enum(["PENDING_APPROVAL", "APPROVED", "PAID", "REJECTED", "CANCELLED"]).optional(), from_date: date.optional(), to_date: date.optional() }).strict();
+type Receipt = z.infer<typeof receipt>; type Claim = z.infer<typeof claim>;
+const normalize = (s: string) => s.trim().toLowerCase();
+const minor = (r: Receipt) => Math.round(r.amount_sar * 100);
+const key = (r: Receipt) => r.receipt_number ? [normalize(r.merchant), normalize(r.receipt_number), r.transaction_date, minor(r), r.currency].join("|") : null;
+const today = () => new Intl.DateTimeFormat("en-CA", {timeZone:"Asia/Riyadh", year:"numeric", month:"2-digit", day:"2-digit"}).format(new Date());
+const id = (prefix: string) => `${prefix}-${crypto.randomUUID()}`;
+const resultSchema = z.object({ status: z.enum(["SUCCESS", "ERROR"]), code: z.string().min(1), message: z.string().min(1), data: z.record(z.string(), z.unknown()).optional() });
+function out(status: "SUCCESS"|"ERROR", code: string, message: string, data?: Record<string,unknown>) { const value = resultSchema.parse({status,code,message,data}); return {content:[{type:"text" as const,text:JSON.stringify(value)}], ...(status === "ERROR" ? {isError:true} : {})}; }
+const ok = (code: string, message: string, data?: Record<string,unknown>) => out("SUCCESS",code,message,data);
+const err = (code: string, message: string, data?: Record<string,unknown>) => out("ERROR",code,message,data);
+function validPolicy(r: Receipt) { const now = today(); return now >= policy.effective_from && now <= policy.valid_until && r.transaction_date >= policy.effective_from && r.transaction_date <= now && r.transaction_date <= policy.valid_until; }
+function missing(c: Claim) { const m: string[]=[]; for(const field of policy.categories[c.expense_category].required) { if(field === "destination" && !c.destination) m.push(field); else if(field === "client_or_project" && !c.client_name && !c.project_name) m.push("client_name or project_name"); else if(field === "client_name" && !c.client_name) m.push(field); else if(field === "attendees" && (!c.attendees || new Set(c.attendees.map(normalize)).size < 2)) m.push("at least two distinct attendees"); else if(!["destination","client_or_project","client_name","attendees"].includes(field)) throw Error("Unsupported policy requirement"); } return m; }
+const support = (c: Claim) => JSON.stringify({ ...(c.destination ? {destination:c.destination}:{}), ...(c.attendees ? {attendees:c.attendees}:{}) });
+// Same exact identifier, or same merchant/date/amount/currency with ambiguous or different reference: conservative review.
+const matchSql = `(r.transaction_key = ? OR (lower(trim(r.merchant)) = ? AND r.transaction_date = ? AND r.amount_minor_units = ? AND r.currency = ?))`;
+const matchArgs = (r: Receipt) => [key(r),normalize(r.merchant),r.transaction_date,minor(r),r.currency] as const;
+type Match = {receipt_id:string; transaction_key:string|null; claim_id:string|null; claim_employee:string|null; claim_status:string|null; escalation_id:string|null; escalation_employee:string|null; notification_status:string|null};
 async function lookup(env:AppEnv,r:Receipt) { const x=await env.DB.prepare(`SELECT r.receipt_id,r.transaction_key,c.claim_id,c.employee_id AS claim_employee,c.status AS claim_status,e.escalation_id,e.employee_id AS escalation_employee,e.notification_status FROM receipts r LEFT JOIN expense_claims c ON c.receipt_id=r.receipt_id LEFT JOIN escalations e ON e.receipt_id=r.receipt_id AND e.review_status='OPEN' WHERE ${matchSql}`).bind(...matchArgs(r)).all<Match>(); return x.results; }
 function classify(rows:Match[],r:Receipt,employee:string) { const exact=rows.filter(x=>key(r)!==null && x.transaction_key===key(r)); const claimed=exact.find(x=>x.claim_id); if(claimed) return {code:"ALREADY_CLAIMED",data:claimed.claim_employee===employee?{claim_id:claimed.claim_id,claim_status:claimed.claim_status}:undefined}; const open=exact.find(x=>x.escalation_id); if(open) return {code:"UNDER_REVIEW",data:open.escalation_employee===employee?{escalation_id:open.escalation_id,notification_status:open.notification_status}:undefined}; if(exact.length) return {code:"PREVIOUSLY_RECORDED",data:undefined}; if(rows.length) return {code:"POTENTIAL_DUPLICATE",data:undefined}; return {code:"NO_MATCH",data:undefined}; }
 const sumSql = `SELECT COALESCE(SUM(r.amount_minor_units),0) AS spent FROM expense_claims c JOIN receipts r ON r.receipt_id=c.receipt_id WHERE c.employee_id=? AND c.expense_category=? AND substr(r.transaction_date,1,7)=? AND c.status IN ('PENDING_APPROVAL','APPROVED','PAID')`;
