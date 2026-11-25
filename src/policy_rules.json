@@ -1,0 +1,12 @@
+{
+  "version": "1.0",
+  "effective_from": "2026-11-01",
+  "valid_until": "2027-12-31",
+  "currency": "SAR",
+  "categories": {
+    "transportation": {"transaction_limit_minor": 25000, "monthly_limit_minor": 150000, "required": ["destination", "client_or_project"]},
+    "client_meal": {"transaction_limit_minor": 50000, "monthly_limit_minor": 200000, "required": ["client_name", "attendees"]},
+    "office_supplies": {"transaction_limit_minor": 30000, "monthly_limit_minor": 100000, "required": []}
+  },
+  "exceptions_allowed": ["POTENTIAL_DUPLICATE", "TRANSACTION_LIMIT_EXCEEDED", "MONTHLY_LIMIT_EXCEEDED"]
+}
